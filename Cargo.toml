@@ -1,0 +1,24 @@
+[package]
+name = "editshell"
+version = "0.1.0"
+edition = "2024"
+description = "A Linux shell built around a freely editable workspace"
+license = "MIT"
+
+[lib]
+name = "editshell"
+path = "src/lib.rs"
+
+[[bin]]
+name = "editshell"
+path = "src/main.rs"
+required-features = ["gui"]
+
+[features]
+default = []
+gui = ["dep:gtk4"]
+
+[dependencies]
+base64 = "0.22"
+libc = "0.2"
+gtk4 = { version = "0.9", optional = true }
