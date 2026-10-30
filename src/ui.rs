@@ -4,7 +4,7 @@ use gtk::gdk;
 use gtk::glib;
 use gtk::prelude::*;
 use gtk4 as gtk;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -19,6 +19,9 @@ struct TabState {
     run_count: u64,
     output_tail: String,
     password_dialog_open: bool,
+    command_history: Vec<String>,
+    history_position: Option<usize>,
+    history_draft: String,
 }
 
 type SharedTab = Rc<RefCell<TabState>>;
@@ -564,7 +567,11 @@ fn add_tab(
         run_count: 0,
         output_tail: String::new(),
         password_dialog_open: false,
+        command_history: Vec::new(),
+        history_position: None,
+        history_draft: String::new(),
     }));
+    let history_editing = Rc::new(Cell::new(false));
 
     {
         let tab_weak = Rc::downgrade(&tab);
@@ -660,6 +667,7 @@ fn add_tab(
     let execute: Rc<dyn Fn()> = {
         let tab = Rc::clone(&tab);
         let output_scroll = output_scroll.clone();
+        let history_editing = Rc::clone(&history_editing);
         Rc::new(move || {
             let (command, result) = {
                 let state = tab.borrow();
@@ -671,6 +679,11 @@ fn add_tab(
             match result {
                 Ok(()) => {
                     let mut state = tab.borrow_mut();
+                    if !command.trim().is_empty() {
+                        state.command_history.push(command.to_string());
+                    }
+                    state.history_position = None;
+                    state.history_draft.clear();
                     state.run_count += 1;
                     let timestamp = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
@@ -686,7 +699,9 @@ fn add_tab(
                             command.as_str()
                         ),
                     );
+                    history_editing.set(true);
                     state.editor.buffer().set_text("");
+                    history_editing.set(false);
                     state.status.set_text(
                         "Au premier plan — répondez ci-dessous ; « + » ouvre un shell local séparé.",
                     );
@@ -775,6 +790,78 @@ fn add_tab(
             } else {
                 glib::Propagation::Proceed
             }
+        });
+        editor.add_controller(controller);
+    }
+    {
+        let tab = Rc::clone(&tab);
+        let history_editing = Rc::clone(&history_editing);
+        editor.buffer().connect_changed(move |_| {
+            if !history_editing.get() {
+                let mut state = tab.borrow_mut();
+                state.history_position = None;
+                state.history_draft.clear();
+            }
+        });
+    }
+    {
+        let tab = Rc::clone(&tab);
+        let history_editing = Rc::clone(&history_editing);
+        let controller = gtk::EventControllerKey::new();
+        controller.connect_key_pressed(move |_, key, _, modifiers| {
+            if !modifiers.contains(gdk::ModifierType::CONTROL_MASK) {
+                return glib::Propagation::Proceed;
+            }
+
+            let older = key == gdk::Key::Up;
+            if !older && key != gdk::Key::Down {
+                return glib::Propagation::Proceed;
+            }
+
+            let mut state = tab.borrow_mut();
+            if state.command_history.is_empty() {
+                return glib::Propagation::Proceed;
+            }
+
+            let history_len = state.command_history.len();
+            let next_position = if older {
+                match state.history_position {
+                    Some(position) => position.saturating_sub(1),
+                    None => {
+                        let buffer = state.editor.buffer();
+                        state.history_draft = buffer
+                            .text(&buffer.start_iter(), &buffer.end_iter(), false)
+                            .to_string();
+                        history_len - 1
+                    }
+                }
+            } else {
+                match state.history_position {
+                    Some(position) if position + 1 < history_len => position + 1,
+                    Some(_) => {
+                        let draft = std::mem::take(&mut state.history_draft);
+                        state.history_position = None;
+                        history_editing.set(true);
+                        let buffer = state.editor.buffer();
+                        buffer.set_text(&draft);
+                        let end = buffer.end_iter();
+                        buffer.place_cursor(&end);
+                        history_editing.set(false);
+                        return glib::Propagation::Stop;
+                    }
+                    None => return glib::Propagation::Proceed,
+                }
+            };
+
+            state.history_position = Some(next_position);
+            let command = state.command_history[next_position].clone();
+            history_editing.set(true);
+            let buffer = state.editor.buffer();
+            buffer.set_text(&command);
+            let end = buffer.end_iter();
+            buffer.place_cursor(&end);
+            history_editing.set(false);
+            glib::Propagation::Stop
         });
         editor.add_controller(controller);
     }
