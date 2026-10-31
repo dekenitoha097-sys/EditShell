@@ -18,6 +18,7 @@ pub enum SessionEvent {
     ClearOutput,
     Finished { status: i32, cwd: PathBuf },
     Failed(String),
+    Exited,
 }
 
 pub struct ShellSession {
@@ -143,11 +144,8 @@ impl ShellSession {
                         for event in decoder.finish() {
                             let _ = reader_events.send(event);
                         }
-                        if reader_running.swap(false, Ordering::AcqRel) {
-                            let _ = reader_events.send(SessionEvent::Failed(
-                                "La session Bash s’est terminée pendant l’exécution.".to_owned(),
-                            ));
-                        }
+                        reader_running.store(false, Ordering::Release);
+                        let _ = reader_events.send(SessionEvent::Exited);
                         break;
                     }
                     Ok(count) => {
@@ -168,11 +166,8 @@ impl ShellSession {
                         for event in decoder.finish() {
                             let _ = reader_events.send(event);
                         }
-                        if reader_running.swap(false, Ordering::AcqRel) {
-                            let _ = reader_events.send(SessionEvent::Failed(
-                                "La session Bash s’est terminée pendant l’exécution.".to_owned(),
-                            ));
-                        }
+                        reader_running.store(false, Ordering::Release);
+                        let _ = reader_events.send(SessionEvent::Exited);
                         break;
                     }
                     Err(error) => {
@@ -541,6 +536,7 @@ mod tests {
                         break;
                     }
                     SessionEvent::Failed(error) => panic!("{error}"),
+                    SessionEvent::Exited => panic!("shell exited unexpectedly"),
                 }
             }
             thread::sleep(Duration::from_millis(10));
@@ -563,6 +559,7 @@ mod tests {
                 status = Some(result);
                 break;
             }
+
             thread::sleep(Duration::from_millis(10));
         }
         assert!(
@@ -572,6 +569,27 @@ mod tests {
 
         session.execute("printf 'session-alive\\n'").unwrap();
         assert!(wait_for_result(&mut session).contains("session-alive"));
+    }
+
+    #[test]
+    fn exit_command_emits_session_ended_event() {
+        let session = ShellSession::start(None).expect("start Bash");
+        session.execute("exit").expect("execute exit");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if let Some(event) = session.try_event() {
+                match event {
+                    SessionEvent::Exited => {
+                        assert!(!session.is_running());
+                        return;
+                    }
+                    SessionEvent::Failed(error) => panic!("{error}"),
+                    _ => {}
+                }
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("exit should end the shell session");
     }
 
     #[test]
@@ -659,6 +677,7 @@ mod tests {
                     SessionEvent::ClearOutput => output.clear(),
                     SessionEvent::Finished { .. } => return output,
                     SessionEvent::Failed(error) => panic!("{error}"),
+                    SessionEvent::Exited => panic!("shell exited unexpectedly"),
                 }
             }
             thread::sleep(Duration::from_millis(10));
