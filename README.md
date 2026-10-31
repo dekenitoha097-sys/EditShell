@@ -5,6 +5,9 @@ EditShell est un prototype Linux en Rust et GTK 4 qui associe un éditeur de com
 ## État du prototype
 
 - Texte de commande libre, modifiable à tout moment ; une édition ne lance jamais une commande.
+- Prompt visuel `utilisateur@machine:répertoire $` au-dessus de l’éditeur, sans l’ajouter à la commande.
+- Complétion avec `Tab` des commandes présentes dans `PATH` et des chemins du répertoire courant ; les espaces dans les chemins sont échappés.
+- Coloration syntaxique de base en direct dans l’éditeur (commandes, mots-clés shell, chaînes, variables, commentaires et opérateurs).
 - Exécution avec `Ctrl+Entrée` ou le bouton **Exécuter**.
 - Après l’envoi réussi, l’éditeur est vidé et la commande est ajoutée à l’historique affiché avec ses résultats.
 - Session Bash persistante par onglet, avec répertoire courant et variables exportées conservés.
@@ -48,14 +51,15 @@ cargo test
 ## Utilisation
 
 1. Écrivez ou modifiez librement une ou plusieurs lignes dans l’éditeur.
-2. Lancez le contenu avec **Exécuter** ou `Ctrl+Entrée`.
-3. La commande envoyée disparaît de l’éditeur et apparaît dans **Historique des commandes et résultats** avec sa sortie et son code de retour.
-4. Dans l’éditeur, utilisez `Ctrl+↑` pour retrouver les commandes précédentes et `Ctrl+↓` pour avancer dans l’historique puis retrouver votre texte en cours.
-5. Si une commande demande un mot de passe, un dialogue sécurisé s’ouvre ; la saisie n’est ni affichée ni ajoutée à l’historique. Pour une confirmation ordinaire (comme SSH `yes/no`), utilisez le champ **Session active** sous l’historique.
-6. Faites glisser le séparateur horizontal entre l’éditeur et l’historique pour régler leur hauteur. L’historique défile automatiquement vers la sortie la plus récente.
-7. Une commande SSH/FTP/SMB interactive reste au premier plan dans son onglet ; utilisez **Session active** pour envoyer les réponses ou commandes distantes. Pour garder un shell local disponible en parallèle, le bouton `+` ouvre un onglet Bash indépendant. `Ctrl+C` ou le bouton d’arrêt interrompt la commande au premier plan.
-8. L’explorateur latéral permet de parcourir les dossiers ; double-cliquez sur un dossier pour l’ouvrir ou sélectionnez un élément puis utilisez **Insérer le chemin**.
-9. Dans **Préférences**, activez ou désactivez les couleurs ANSI et choisissez la palette standard ou à contraste élevé. Les couleurs affichées sont celles émises par les commandes, par exemple `ls`.
+2. Appuyez sur `Tab` pour compléter une commande ou un chemin. Pour plusieurs correspondances, EditShell complète le préfixe commun puis affiche des suggestions dans la barre d’état.
+3. Lancez le contenu avec **Exécuter** ou `Ctrl+Entrée`.
+4. La commande envoyée disparaît de l’éditeur et apparaît dans **Historique des commandes et résultats** avec sa sortie et son code de retour.
+5. Dans l’éditeur, utilisez `Ctrl+↑` pour retrouver les commandes précédentes et `Ctrl+↓` pour avancer dans l’historique puis retrouver votre texte en cours.
+6. Si une commande demande un mot de passe, un dialogue sécurisé s’ouvre ; la saisie n’est ni affichée ni ajoutée à l’historique. Pour une confirmation ordinaire (comme SSH `yes/no`), utilisez le champ **Session active** sous l’historique.
+7. Faites glisser le séparateur horizontal entre l’éditeur et l’historique pour régler leur hauteur. L’historique défile automatiquement vers la sortie la plus récente.
+8. Une commande SSH/FTP/SMB interactive reste au premier plan dans son onglet ; utilisez **Session active** pour envoyer les réponses ou commandes distantes. Pour garder un shell local disponible en parallèle, le bouton `+` ouvre un onglet Bash indépendant. `Ctrl+C` ou le bouton d’arrêt interrompt la commande au premier plan.
+9. L’explorateur latéral permet de parcourir les dossiers ; double-cliquez sur un dossier pour l’ouvrir ou sélectionnez un élément puis utilisez **Insérer le chemin**.
+10. Dans **Préférences**, activez ou désactivez les couleurs ANSI et choisissez la palette standard ou à contraste élevé. Les couleurs affichées sont celles émises par les commandes, par exemple `ls`.
 
 Une commande échouée ne ferme pas la session. Chaque exécution produit une nouvelle entrée dans l’historique. Pour réutiliser une commande, recopiez-la depuis l’historique vers l’éditeur.
 
