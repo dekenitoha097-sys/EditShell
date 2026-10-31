@@ -79,7 +79,7 @@ impl ShellSession {
             .env(
                 "PROMPT_COMMAND",
                 format!(
-                    "__editshell_status=$?; __editshell_pwd=$(printf '%s' \"$PWD\" | base64 -w0); printf '\\036EDITSHELL:{nonce}:%s:%s\\037\\n' \"$__editshell_status\" \"$__editshell_pwd\""
+                    "__editshell_status=$?; alias ls='ls --color=always'; __editshell_pwd=$(printf '%s' \"$PWD\" | base64 -w0); printf '\\036EDITSHELL:{nonce}:%s:%s\\037\\n' \"$__editshell_status\" \"$__editshell_pwd\""
                 ),
             )
             .stdin(Stdio::from(slave.try_clone()?))
@@ -414,6 +414,11 @@ fn strip_terminal_sequences(text: &str) -> (String, bool) {
                             {
                                 cleared = true;
                             }
+                            if code == 'm' {
+                                output.push_str("\u{1b}[");
+                                output.push_str(&sequence);
+                                output.push('m');
+                            }
                             break;
                         }
                         sequence.push(code);
@@ -488,6 +493,23 @@ mod tests {
                 |event| matches!(event, SessionEvent::Output(text) if text.contains('\u{1b}'))
             )
         );
+    }
+
+    #[test]
+    fn ansi_color_sequences_are_preserved_for_styled_output() {
+        let (output, cleared) = strip_terminal_sequences("\u{1b}[1;31mred\u{1b}[0m");
+        assert_eq!(output, "\u{1b}[1;31mred\u{1b}[0m");
+        assert!(!cleared);
+    }
+
+    #[test]
+    fn ls_uses_color_output_by_default() {
+        let mut session = ShellSession::start(None).expect("start Bash");
+        session
+            .execute("ls --color=always")
+            .expect("execute colorized ls");
+        let output = wait_for_result(&mut session);
+        assert!(output.contains("\u{1b}["), "{output:?}");
     }
 
     #[test]

@@ -11,10 +11,19 @@ pub enum Theme {
     Dark,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OutputPalette {
+    #[default]
+    Standard,
+    HighContrast,
+}
+
 #[derive(Clone, Debug)]
 pub struct Settings {
     pub theme: Theme,
     pub font_size: u8,
+    pub colorize_output: bool,
+    pub output_palette: OutputPalette,
 }
 
 impl Default for Settings {
@@ -22,6 +31,8 @@ impl Default for Settings {
         Self {
             theme: Theme::System,
             font_size: 13,
+            colorize_output: true,
+            output_palette: OutputPalette::Standard,
         }
     }
 }
@@ -63,6 +74,17 @@ impl Settings {
                         settings.font_size = size.clamp(8, 32);
                     }
                 }
+                "colorize_output" => {
+                    if let Ok(enabled) = value.trim().parse::<bool>() {
+                        settings.colorize_output = enabled;
+                    }
+                }
+                "output_palette" => {
+                    settings.output_palette = match value.trim().trim_matches('"') {
+                        "high_contrast" => OutputPalette::HighContrast,
+                        _ => OutputPalette::Standard,
+                    };
+                }
                 _ => {}
             }
         }
@@ -85,7 +107,15 @@ impl Settings {
         };
         fs::write(
             path,
-            format!("theme = \"{theme}\"\nfont_size = {}\n", self.font_size),
+            format!(
+                "theme = \"{theme}\"\nfont_size = {}\ncolorize_output = {}\noutput_palette = \"{}\"\n",
+                self.font_size,
+                self.colorize_output,
+                match self.output_palette {
+                    OutputPalette::Standard => "standard",
+                    OutputPalette::HighContrast => "high_contrast",
+                }
+            ),
         )
     }
 }
@@ -99,6 +129,8 @@ mod tests {
         let settings = Settings::default();
         assert_eq!(settings.theme, Theme::System);
         assert_eq!(settings.font_size, 13);
+        assert!(settings.colorize_output);
+        assert_eq!(settings.output_palette, OutputPalette::Standard);
     }
 
     #[test]
@@ -106,12 +138,17 @@ mod tests {
         let settings = Settings::parse("theme = \"nonsense\"\nfont_size = invalid\n");
         assert_eq!(settings.theme, Theme::System);
         assert_eq!(settings.font_size, 13);
+        assert!(settings.colorize_output);
     }
 
     #[test]
     fn valid_settings_are_loaded_and_font_size_is_clamped() {
-        let settings = Settings::parse("theme = \"dark\"\nfont_size = 100\n");
+        let settings = Settings::parse(
+            "theme = \"dark\"\nfont_size = 100\ncolorize_output = false\noutput_palette = \"high_contrast\"\n",
+        );
         assert_eq!(settings.theme, Theme::Dark);
         assert_eq!(settings.font_size, 32);
+        assert!(!settings.colorize_output);
+        assert_eq!(settings.output_palette, OutputPalette::HighContrast);
     }
 }
