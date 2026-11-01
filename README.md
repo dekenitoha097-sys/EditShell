@@ -38,6 +38,24 @@ sudo apt install build-essential pkg-config libgtk-4-dev
 
 Le prototype utilise GTK 4 directement ; Libadwaita et VTE ne sont pas encore ajoutés, car leur intégration ne fait pas partie de cette première tranche fonctionnelle.
 
+## Installer EditShell dans le menu des applications
+
+Depuis la racine du dépôt, lancez :
+
+```sh
+./scripts/install.sh
+```
+
+Le script compile EditShell en mode release et installe le binaire dans `~/.local/bin`, le fichier `.desktop` dans le dossier d’applications utilisateur XDG et l’icône dans le thème `hicolor` de l’utilisateur. L’application apparaît alors dans le menu des applications ; vous pouvez aussi l’épingler au dock depuis ce menu. L’installation ne demande pas les droits administrateur. Une icône SVG est fournie dans `assets/`, donc aucune image supplémentaire n’est requise. Vous pouvez remplacer ce SVG par votre propre création en gardant son nom pour conserver l’intégration automatique.
+
+Pour supprimer ces fichiers utilisateur, depuis le dépôt, lancez :
+
+```sh
+./scripts/uninstall.sh
+```
+
+Les scripts ne suppriment pas le dépôt, les paramètres d’EditShell ni les fichiers créés par l’utilisateur.
+
 ## Compiler et lancer
 
 ```sh
