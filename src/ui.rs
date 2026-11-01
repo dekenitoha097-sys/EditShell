@@ -1,10 +1,11 @@
-use editshell::config::{Settings, Theme};
+use editshell::config::{OutputPalette, Settings, Theme};
 use editshell::shell::{SessionEvent, ShellSession, bash_quote};
 use gtk::gdk;
 use gtk::glib;
 use gtk::prelude::*;
 use gtk4 as gtk;
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -22,9 +23,24 @@ struct TabState {
     command_history: Vec<String>,
     history_position: Option<usize>,
     history_draft: String,
+    terminal_style: AnsiStyle,
+    output_tags: HashMap<AnsiStyle, gtk::TextTag>,
 }
 
 type SharedTab = Rc<RefCell<TabState>>;
+
+struct TabOptions {
+    settings: Rc<RefCell<Settings>>,
+    start_dir: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
+struct AnsiStyle {
+    foreground: Option<String>,
+    background: Option<String>,
+    bold: bool,
+    underline: bool,
+}
 
 pub fn run() {
     let app = gtk::Application::builder()
@@ -102,6 +118,7 @@ fn build_window(app: &gtk::Application) {
     let cwd_for_new = cwd_label.clone();
     let explorer_root = explorer.set_root.clone();
     let window_for_new_tab = window.clone();
+    let settings_for_new_tab = Rc::clone(&settings);
     new_tab.connect_clicked(move |_| {
         add_tab(
             &notebook_for_new,
@@ -110,7 +127,10 @@ fn build_window(app: &gtk::Application) {
             &cwd_for_new,
             &explorer_root,
             &window_for_new_tab,
-            None,
+            TabOptions {
+                settings: Rc::clone(&settings_for_new_tab),
+                start_dir: None,
+            },
         );
     });
 
@@ -142,7 +162,10 @@ fn build_window(app: &gtk::Application) {
         &cwd_label,
         &explorer.set_root,
         &window,
-        None,
+        TabOptions {
+            settings: Rc::clone(&settings),
+            start_dir: None,
+        },
     );
     window.present();
 }
@@ -428,8 +451,12 @@ fn add_tab(
     cwd_label: &gtk::Label,
     set_explorer_root: &Rc<dyn Fn(PathBuf)>,
     parent_window: &gtk::ApplicationWindow,
-    start_dir: Option<PathBuf>,
+    options: TabOptions,
 ) {
+    let TabOptions {
+        settings,
+        start_dir,
+    } = options;
     let cwd = start_dir
         .or_else(|| {
             active_tab
@@ -570,6 +597,8 @@ fn add_tab(
         command_history: Vec::new(),
         history_position: None,
         history_draft: String::new(),
+        terminal_style: AnsiStyle::default(),
+        output_tags: HashMap::new(),
     }));
     let history_editing = Rc::new(Cell::new(false));
 
@@ -579,6 +608,7 @@ fn add_tab(
         let active_tab = Rc::clone(active_tab);
         let set_explorer_root = Rc::clone(set_explorer_root);
         let parent_window = parent_window.clone();
+        let settings = Rc::clone(&settings);
         let output_scroll = output_scroll.clone();
         let interactive_input = interactive_input.clone();
         let send_input = send_input.clone();
@@ -599,13 +629,26 @@ fn add_tab(
                             password_prompt = true;
                             state.output_tail.clear();
                         }
+                        let preferences = settings.borrow();
                         let buffer = state.output.buffer();
-                        let mut end = buffer.end_iter();
-                        buffer.insert(&mut end, &text);
+                        let TabState {
+                            terminal_style,
+                            output_tags,
+                            ..
+                        } = &mut *state;
+                        append_terminal_output(
+                            &buffer,
+                            &text,
+                            preferences.colorize_output,
+                            preferences.output_palette,
+                            terminal_style,
+                            output_tags,
+                        );
                         scroll_output_to_bottom(&output_scroll);
                     }
                     SessionEvent::ClearOutput => {
                         state.output.buffer().set_text("");
+                        state.terminal_style = AnsiStyle::default();
                     }
                     SessionEvent::Finished { status, cwd } => {
                         state.cwd = cwd;
@@ -955,6 +998,24 @@ fn show_preferences(window: &gtk::ApplicationWindow, settings: &Rc<RefCell<Setti
     font_row.append(&font_size);
     content.append(&font_row);
 
+    let colorize_output =
+        gtk::CheckButton::with_label("Afficher les couleurs ANSI dans les résultats");
+    colorize_output.set_active(settings.borrow().colorize_output);
+    content.append(&colorize_output);
+
+    let palette_row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    let palette_label = gtk::Label::new(Some("Palette des résultats"));
+    palette_label.set_xalign(0.0);
+    palette_label.set_hexpand(true);
+    let palette = gtk::DropDown::from_strings(&["Standard", "Contraste élevé"]);
+    palette.set_selected(match settings.borrow().output_palette {
+        OutputPalette::Standard => 0,
+        OutputPalette::HighContrast => 1,
+    });
+    palette_row.append(&palette_label);
+    palette_row.append(&palette);
+    content.append(&palette_row);
+
     let settings = Rc::clone(settings);
     dialog.connect_response(move |dialog, response| {
         if response == gtk::ResponseType::Accept {
@@ -965,6 +1026,11 @@ fn show_preferences(window: &gtk::ApplicationWindow, settings: &Rc<RefCell<Setti
                     _ => Theme::System,
                 },
                 font_size: font_size.value_as_int().clamp(8, 32) as u8,
+                colorize_output: colorize_output.is_active(),
+                output_palette: match palette.selected() {
+                    1 => OutputPalette::HighContrast,
+                    _ => OutputPalette::Standard,
+                },
             };
             match next.save() {
                 Ok(()) => {
@@ -978,6 +1044,183 @@ fn show_preferences(window: &gtk::ApplicationWindow, settings: &Rc<RefCell<Setti
         dialog.close();
     });
     dialog.present();
+}
+
+fn append_terminal_output(
+    buffer: &gtk::TextBuffer,
+    text: &str,
+    colorize: bool,
+    palette: OutputPalette,
+    style: &mut AnsiStyle,
+    tags: &mut HashMap<AnsiStyle, gtk::TextTag>,
+) {
+    if !colorize {
+        *style = AnsiStyle::default();
+    }
+    let characters: Vec<char> = text.chars().collect();
+    let mut index = 0;
+    let mut segment = String::new();
+    while index < characters.len() {
+        if characters[index] == '\u{1b}'
+            && characters.get(index + 1) == Some(&'[')
+            && let Some(relative_end) = characters[index + 2..].iter().position(|ch| *ch == 'm')
+        {
+            insert_terminal_segment(buffer, &segment, colorize, style, tags);
+            segment.clear();
+            if colorize {
+                let parameters: String = characters[index + 2..index + 2 + relative_end]
+                    .iter()
+                    .collect();
+                apply_ansi_parameters(style, &parameters, palette);
+            }
+            index += relative_end + 3;
+        } else {
+            segment.push(characters[index]);
+            index += 1;
+        }
+    }
+    insert_terminal_segment(buffer, &segment, colorize, style, tags);
+}
+
+fn insert_terminal_segment(
+    buffer: &gtk::TextBuffer,
+    text: &str,
+    colorize: bool,
+    style: &AnsiStyle,
+    tags: &mut HashMap<AnsiStyle, gtk::TextTag>,
+) {
+    if text.is_empty() {
+        return;
+    }
+    let start_offset = buffer.char_count();
+    let mut insertion_point = buffer.end_iter();
+    buffer.insert(&mut insertion_point, text);
+    if !colorize || *style == AnsiStyle::default() {
+        return;
+    }
+
+    let tag = tags.entry(style.clone()).or_insert_with(|| {
+        let mut builder = gtk::TextTag::builder();
+        if let Some(color) = &style.foreground {
+            builder = builder.foreground(color);
+        }
+        if let Some(color) = &style.background {
+            builder = builder.background(color);
+        }
+        if style.bold {
+            builder = builder.weight(700);
+        }
+        if style.underline {
+            builder = builder.underline(gtk::pango::Underline::Single);
+        }
+        let tag = builder.build();
+        buffer.tag_table().add(&tag);
+        tag
+    });
+    let start = buffer.iter_at_offset(start_offset);
+    let end = buffer.iter_at_offset(start_offset + text.chars().count() as i32);
+    buffer.apply_tag(tag, &start, &end);
+}
+
+fn apply_ansi_parameters(style: &mut AnsiStyle, parameters: &str, palette: OutputPalette) {
+    let values: Vec<u16> = if parameters.is_empty() {
+        vec![0]
+    } else {
+        parameters
+            .split(';')
+            .map(|value| value.parse::<u16>().unwrap_or(0))
+            .collect()
+    };
+    let mut index = 0;
+    while index < values.len() {
+        match values[index] {
+            0 => *style = AnsiStyle::default(),
+            1 => style.bold = true,
+            22 => style.bold = false,
+            4 => style.underline = true,
+            24 => style.underline = false,
+            30..=37 => {
+                style.foreground = Some(ansi_basic_color(values[index] - 30, false, palette))
+            }
+            39 => style.foreground = None,
+            40..=47 => {
+                style.background = Some(ansi_basic_color(values[index] - 40, false, palette))
+            }
+            49 => style.background = None,
+            90..=97 => style.foreground = Some(ansi_basic_color(values[index] - 90, true, palette)),
+            100..=107 => {
+                style.background = Some(ansi_basic_color(values[index] - 100, true, palette))
+            }
+            38 | 48 if values.get(index + 1) == Some(&5) => {
+                if let Some(color) = values.get(index + 2).copied() {
+                    let color = ansi_256_color(color);
+                    if values[index] == 38 {
+                        style.foreground = Some(color);
+                    } else {
+                        style.background = Some(color);
+                    }
+                    index += 2;
+                }
+            }
+            38 | 48 if values.get(index + 1) == Some(&2) && index + 4 < values.len() => {
+                let color = format!(
+                    "#{:02x}{:02x}{:02x}",
+                    values[index + 2].min(255),
+                    values[index + 3].min(255),
+                    values[index + 4].min(255)
+                );
+                if values[index] == 38 {
+                    style.foreground = Some(color);
+                } else {
+                    style.background = Some(color);
+                }
+                index += 4;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+}
+
+fn ansi_basic_color(index: u16, bright: bool, palette: OutputPalette) -> String {
+    const STANDARD: [&str; 16] = [
+        "#666666", "#cd3131", "#0dbc79", "#e5e510", "#2472c8", "#bc3fbc", "#11a8cd", "#e5e5e5",
+        "#808080", "#f14c4c", "#23d18b", "#f5f543", "#3b8eea", "#d670d6", "#29b8db", "#ffffff",
+    ];
+    const HIGH_CONTRAST: [&str; 16] = [
+        "#8b949e", "#ff7b72", "#3fb950", "#d29922", "#58a6ff", "#bc8cff", "#39c5cf", "#f0f6fc",
+        "#6e7681", "#ffa198", "#56d364", "#e3b341", "#79c0ff", "#d2a8ff", "#56d4dd", "#ffffff",
+    ];
+    let color_index = usize::from(index.min(7)) + if bright { 8 } else { 0 };
+    match palette {
+        OutputPalette::Standard => STANDARD[color_index],
+        OutputPalette::HighContrast => HIGH_CONTRAST[color_index],
+    }
+    .to_owned()
+}
+
+fn ansi_256_color(index: u16) -> String {
+    const BASE: [&str; 16] = [
+        "#666666", "#cd3131", "#0dbc79", "#e5e510", "#2472c8", "#bc3fbc", "#11a8cd", "#e5e5e5",
+        "#808080", "#f14c4c", "#23d18b", "#f5f543", "#3b8eea", "#d670d6", "#29b8db", "#ffffff",
+    ];
+    match index {
+        0..=15 => BASE[index as usize].to_owned(),
+        16..=231 => {
+            let value = index - 16;
+            let levels = [0, 95, 135, 175, 215, 255];
+            format!(
+                "#{:02x}{:02x}{:02x}",
+                levels[(value / 36) as usize],
+                levels[((value / 6) % 6) as usize],
+                levels[(value % 6) as usize]
+            )
+        }
+        _ => {
+            let gray = 8 + (index.min(255) - 232) * 10;
+            format!("#{gray:02x}{gray:02x}{gray:02x}")
+        }
+    }
 }
 
 fn scroll_output_to_bottom(scrolled: &gtk::ScrolledWindow) {
