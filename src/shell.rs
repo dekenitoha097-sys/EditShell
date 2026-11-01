@@ -16,6 +16,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub enum SessionEvent {
     Output(String),
     ClearOutput,
+    TerminalScreenStarted,
+    TerminalOutput(Vec<u8>),
+    TerminalScreenEnded,
     Finished { status: i32, cwd: PathBuf },
     Failed(String),
     Exited,
@@ -252,6 +255,37 @@ impl ShellSession {
         terminal.write_all(b"\n")?;
         terminal.flush()
     }
+
+    pub fn send_raw_input(&self, input: &[u8]) -> io::Result<()> {
+        if !self.is_running() {
+            return Err(io::Error::other(
+                "aucune commande interactive n’est en cours",
+            ));
+        }
+        let mut terminal = self
+            .terminal_input
+            .lock()
+            .map_err(|_| io::Error::other("terminal writer lock poisoned"))?;
+        terminal.write_all(input)?;
+        terminal.flush()
+    }
+
+    pub fn resize_terminal(&self, columns: u16, rows: u16) -> io::Result<()> {
+        let terminal = self
+            .terminal_input
+            .lock()
+            .map_err(|_| io::Error::other("terminal writer lock poisoned"))?;
+        let size = libc::winsize {
+            ws_row: rows,
+            ws_col: columns,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        if unsafe { libc::ioctl(terminal.as_raw_fd(), libc::TIOCSWINSZ, &size) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
 }
 
 impl Drop for ShellSession {
@@ -277,6 +311,7 @@ struct PtyOutputParser {
     pending: Vec<u8>,
     nonce: String,
     skip_marker_newline: bool,
+    in_alternate_screen: bool,
 }
 
 impl PtyOutputParser {
@@ -285,6 +320,7 @@ impl PtyOutputParser {
             pending: Vec::new(),
             nonce,
             skip_marker_newline: false,
+            in_alternate_screen: false,
         }
     }
 
@@ -308,7 +344,8 @@ impl PtyOutputParser {
 
             if let Some(marker_start) = self.pending.iter().position(|byte| *byte == 0x1e) {
                 if marker_start > 0 {
-                    self.emit_output(&self.pending[..marker_start], &mut events);
+                    let output = self.pending[..marker_start].to_vec();
+                    self.emit_output(&output, &mut events);
                 }
                 let Some(marker_end) = self.pending[marker_start + 1..]
                     .iter()
@@ -324,7 +361,8 @@ impl PtyOutputParser {
                     self.pending.drain(..marker_end + 1);
                     self.skip_marker_newline = true;
                 } else {
-                    self.emit_output(&self.pending[..marker_end + 1], &mut events);
+                    let output = self.pending[..marker_end + 1].to_vec();
+                    self.emit_output(&output, &mut events);
                     self.pending.drain(..marker_end + 1);
                 }
                 continue;
@@ -344,7 +382,8 @@ impl PtyOutputParser {
             if safe_len == 0 {
                 break;
             }
-            self.emit_output(&self.pending[..safe_len], &mut events);
+            let output = self.pending[..safe_len].to_vec();
+            self.emit_output(&output, &mut events);
             self.pending.drain(..safe_len);
         }
         events
@@ -356,10 +395,58 @@ impl PtyOutputParser {
             let pending = std::mem::take(&mut self.pending);
             self.emit_output(&pending, &mut events);
         }
+        if self.in_alternate_screen {
+            self.in_alternate_screen = false;
+            events.push(SessionEvent::TerminalScreenEnded);
+        }
         events
     }
 
-    fn emit_output(&self, bytes: &[u8], events: &mut Vec<SessionEvent>) {
+    fn emit_output(&mut self, bytes: &[u8], events: &mut Vec<SessionEvent>) {
+        let mut cursor = 0;
+        let mut scan = 0;
+        while scan + 1 < bytes.len() {
+            if bytes[scan] == 0x1b && bytes[scan + 1] == b'[' {
+                if let Some(relative_end) = bytes[scan + 2..]
+                    .iter()
+                    .position(|byte| (0x40..=0x7e).contains(byte))
+                {
+                    let end = scan + 2 + relative_end;
+                    match alternate_screen_mode(&bytes[scan..=end]) {
+                        Some(true) if !self.in_alternate_screen => {
+                            self.emit_plain_output(&bytes[cursor..scan], events);
+                            self.in_alternate_screen = true;
+                            events.push(SessionEvent::TerminalScreenStarted);
+                            cursor = scan;
+                        }
+                        Some(false) if self.in_alternate_screen => {
+                            events.push(SessionEvent::TerminalOutput(bytes[cursor..=end].to_vec()));
+                            self.in_alternate_screen = false;
+                            events.push(SessionEvent::TerminalScreenEnded);
+                            cursor = end + 1;
+                        }
+                        _ => {}
+                    }
+                    scan = end + 1;
+                    continue;
+                }
+            }
+            scan += 1;
+        }
+
+        if cursor < bytes.len() {
+            if self.in_alternate_screen {
+                events.push(SessionEvent::TerminalOutput(bytes[cursor..].to_vec()));
+            } else {
+                self.emit_plain_output(&bytes[cursor..], events);
+            }
+        }
+    }
+
+    fn emit_plain_output(&self, bytes: &[u8], events: &mut Vec<SessionEvent>) {
+        if bytes.is_empty() {
+            return;
+        }
         let text = String::from_utf8_lossy(bytes);
         let (output, cleared) = strip_terminal_sequences(&text);
         if cleared {
@@ -369,6 +456,20 @@ impl PtyOutputParser {
             events.push(SessionEvent::Output(output));
         }
     }
+}
+
+fn alternate_screen_mode(sequence: &[u8]) -> Option<bool> {
+    let final_byte = *sequence.last()?;
+    let enabled = match final_byte {
+        b'h' => true,
+        b'l' => false,
+        _ => return None,
+    };
+    let parameters = std::str::from_utf8(sequence.get(2..sequence.len() - 1)?).ok()?;
+    parameters
+        .split(';')
+        .any(|parameter| matches!(parameter, "?47" | "?1047" | "?1049"))
+        .then_some(enabled)
 }
 
 fn terminal_escape_is_complete(bytes: &[u8]) -> bool {
@@ -491,6 +592,34 @@ mod tests {
     }
 
     #[test]
+    fn alternate_screen_is_routed_to_interactive_terminal() {
+        let mut decoder = PtyOutputParser::new("nonce".to_owned());
+        let events = decoder.push(b"before\x1b[?1049h\x1b[2Jchoice\x1b[?1049lafter");
+        assert!(matches!(events[0], SessionEvent::Output(ref text) if text == "before"));
+        assert!(matches!(events[1], SessionEvent::TerminalScreenStarted));
+        assert!(
+            matches!(events[2], SessionEvent::TerminalOutput(ref bytes) if bytes == b"\x1b[?1049h\x1b[2Jchoice\x1b[?1049l")
+        );
+        assert!(matches!(events[3], SessionEvent::TerminalScreenEnded));
+        assert!(matches!(events[4], SessionEvent::Output(ref text) if text == "after"));
+    }
+
+    #[test]
+    fn alternate_screen_detection_handles_split_escape_sequences() {
+        let mut decoder = PtyOutputParser::new("nonce".to_owned());
+        assert!(decoder.push(b"\x1b[?104").is_empty());
+        let events = decoder.push(b"9hprompt");
+        assert!(matches!(events[0], SessionEvent::TerminalScreenStarted));
+        assert!(
+            matches!(events[1], SessionEvent::TerminalOutput(ref bytes) if bytes == b"\x1b[?1049hprompt")
+        );
+        assert!(matches!(
+            decoder.push(b"\x1b[?1049l").last(),
+            Some(SessionEvent::TerminalScreenEnded)
+        ));
+    }
+
+    #[test]
     fn ansi_color_sequences_are_preserved_for_styled_output() {
         let (output, cleared) = strip_terminal_sequences("\u{1b}[1;31mred\u{1b}[0m");
         assert_eq!(output, "\u{1b}[1;31mred\u{1b}[0m");
@@ -531,6 +660,10 @@ mod tests {
                 match event {
                     SessionEvent::ClearOutput => cleared = true,
                     SessionEvent::Output(text) => raw_escape |= text.contains('\u{1b}'),
+                    SessionEvent::TerminalOutput(bytes) => {
+                        raw_escape |= bytes.contains(&0x1b);
+                    }
+                    SessionEvent::TerminalScreenStarted | SessionEvent::TerminalScreenEnded => {}
                     SessionEvent::Finished { .. } => {
                         finished = true;
                         break;
@@ -606,6 +739,19 @@ mod tests {
     }
 
     #[test]
+    fn raw_terminal_input_reaches_running_command_without_newline() {
+        let mut session = ShellSession::start(None).expect("start Bash");
+        session
+            .execute("IFS= read -r -n 1 answer; printf 'received:%s\\n' \"$answer\"")
+            .expect("execute single-character read");
+        thread::sleep(Duration::from_millis(100));
+        session
+            .send_raw_input(b"x")
+            .expect("send terminal key without newline");
+        assert!(wait_for_result(&mut session).contains("received:x"));
+    }
+
+    #[test]
     fn hidden_password_prompt_accepts_input_without_echoing_it() {
         let mut session = ShellSession::start(None).expect("start Bash");
         session
@@ -674,7 +820,11 @@ mod tests {
             while let Some(event) = session.try_event() {
                 match event {
                     SessionEvent::Output(text) => output.push_str(&text),
+                    SessionEvent::TerminalOutput(bytes) => {
+                        output.push_str(&String::from_utf8_lossy(&bytes));
+                    }
                     SessionEvent::ClearOutput => output.clear(),
+                    SessionEvent::TerminalScreenStarted | SessionEvent::TerminalScreenEnded => {}
                     SessionEvent::Finished { .. } => return output,
                     SessionEvent::Failed(error) => panic!("{error}"),
                     SessionEvent::Exited => panic!("shell exited unexpectedly"),

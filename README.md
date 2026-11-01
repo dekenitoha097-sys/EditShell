@@ -16,27 +16,28 @@ EditShell est un prototype Linux en Rust et GTK 4 qui associe un éditeur de com
 - `clear` efface la sortie ; `Ctrl+C` ou le bouton d’arrêt interrompt la commande au premier plan sans fermer Bash.
 - Les couleurs ANSI des commandes sont rendues dans l’historique ; `ls` affiche les couleurs de fichiers et dossiers. L’activation et la palette (standard ou contraste élevé) se règlent dans **Préférences**.
 - Dialogue de saisie masquée pour les invites de mot de passe reconnues ; champ distinct pour les réponses interactives ordinaires, comme la confirmation d’une nouvelle clé hôte SSH.
+- Dialogue terminal VTE pour les applications plein écran ncurses, avec flèches, Entrée, redimensionnement et interruption clavier.
 - Zone d’historique agrandie et redimensionnable avec séparateur ; le défilement suit automatiquement les nouvelles sorties.
 - Explorateur de fichiers : navigation, raccourcis vers le dossier parent et personnel, actualisation, sélection puis insertion explicite d’un chemin cité.
 - Menu contextuel au clic droit sur les fichiers et dossiers : insérer ou copier le chemin, naviguer dans un dossier depuis EditShell et ouvrir avec l’application ou l’explorateur de fichiers du système.
 - Préférences persistantes pour le thème (système, clair, sombre), la taille de police, l’affichage des couleurs ANSI et la palette de sortie.
 - Les commandes s’exécutent en arrière-plan par rapport à la boucle GTK.
 
-Il s’agit toujours d’un prototype. Le PTY prend en charge les réponses interactives en ligne et l’interruption des commandes longues, mais la zone de sortie n’est pas encore un émulateur terminal complet : les éditeurs plein écran et les applications interactives nécessitant un clavier en temps réel ne sont pas encore pris en charge. La fermeture d’un onglet en cours d’exécution est empêchée jusqu’à la fin ou l’interruption de sa commande.
+Il s’agit toujours d’un prototype. Les dialogues plein écran utilisant les modes d’écran alternatifs du terminal sont rendus dans une fenêtre VTE interactive. La fermeture d’un onglet en cours d’exécution est empêchée jusqu’à la fin ou l’interruption de sa commande.
 
 ## Dépendances
 
 - Rust et Cargo (édition 2024).
 - Bash.
-- GTK 4 et ses fichiers de développement pour compiler l’interface.
+- GTK 4, VTE GTK 4 et leurs fichiers de développement pour compiler l’interface.
 
 Sur Ubuntu, installer les dépendances système avec :
 
 ```sh
-sudo apt install build-essential pkg-config libgtk-4-dev
+sudo apt install build-essential pkg-config libgtk-4-dev libvte-2.91-gtk4-dev
 ```
 
-Le prototype utilise GTK 4 directement ; Libadwaita et VTE ne sont pas encore ajoutés, car leur intégration ne fait pas partie de cette première tranche fonctionnelle.
+EditShell utilise GTK 4 et VTE GTK 4 pour afficher les applications de terminal interactives.
 
 ## Installer EditShell dans le menu des applications
 
@@ -92,5 +93,5 @@ Une commande échouée ne ferme pas la session. Chaque exécution produit une no
 
 ## Limites et prochaines étapes
 
-La zone de sortie ne fournit pas encore l’ensemble des fonctions d’un émulateur terminal : saisie clavier en temps réel pour les applications plein écran et commandes d’écran avancées ne sont pas encore prises en charge. La coloration syntaxique shell, les opérations de fichiers mutantes, la distribution Linux et la mise en paquet restent à réaliser.
+Les applications qui n’activent pas le mode d’écran alternatif peuvent rester dans l’historique de sortie classique. La coloration syntaxique shell, les opérations de fichiers mutantes, la distribution Linux et la mise en paquet restent à réaliser.
 # EditShell
