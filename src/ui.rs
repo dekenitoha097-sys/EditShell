@@ -6,7 +6,10 @@ use gtk::prelude::*;
 use gtk4 as gtk;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::collections::HashSet;
+use std::env;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -61,7 +64,7 @@ fn build_window(app: &gtk::Application) {
         .application(app)
         .title("EditShell")
         .default_width(1180)
-        .default_height(760)
+        .default_height(680)
         .build();
 
     let header = gtk::HeaderBar::new();
@@ -484,15 +487,20 @@ fn add_tab(
     editor.set_right_margin(14);
     editor.add_css_class("shell-editor");
     editor.set_tooltip_text(Some(
-        "Éditez librement vos commandes. Ctrl+Entrée les exécute.",
+        "Éditez librement vos commandes. Tab complète les commandes et chemins ; Ctrl+Entrée exécute.",
     ));
+    let prompt = gtk::Label::new(Some(&shell_prompt(&cwd)));
+    prompt.set_xalign(0.0);
+    prompt.set_margin_start(14);
+    prompt.set_margin_top(6);
+    prompt.add_css_class("shell-prompt");
 
     let output = gtk::TextView::new();
     output.set_editable(false);
     output.set_cursor_visible(false);
     output.set_monospace(true);
     output.set_wrap_mode(gtk::WrapMode::WordChar);
-    output.set_size_request(-1, 180);
+    output.set_size_request(-1, 120);
     output.set_left_margin(14);
     output.set_right_margin(14);
     output.set_top_margin(8);
@@ -515,7 +523,7 @@ fn add_tab(
     actions.set_margin_end(10);
     actions.set_margin_top(8);
     actions.set_margin_bottom(4);
-    let hint = gtk::Label::new(Some("Édition libre · Ctrl+Entrée"));
+    let hint = gtk::Label::new(Some("Tab compléter · Ctrl+Entrée exécuter"));
     hint.set_xalign(0.0);
     hint.set_hexpand(true);
     hint.add_css_class("dim-label");
@@ -524,7 +532,7 @@ fn add_tab(
     actions.append(&stop_button);
 
     let output_scroll = gtk::ScrolledWindow::new();
-    output_scroll.set_min_content_height(300);
+    output_scroll.set_min_content_height(140);
     output_scroll.set_vexpand(true);
     output_scroll.set_child(Some(&output));
     let history_heading = gtk::Box::new(gtk::Orientation::Horizontal, 8);
@@ -558,16 +566,17 @@ fn add_tab(
     interactive_row.append(&send_input);
 
     let editor_area = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    editor_area.set_size_request(-1, 220);
+    editor_area.set_size_request(-1, 125);
     editor_area.append(&actions);
+    editor_area.append(&prompt);
     let editor_scroll = gtk::ScrolledWindow::new();
-    editor_scroll.set_min_content_height(220);
+    editor_scroll.set_min_content_height(80);
     editor_scroll.set_vexpand(true);
     editor_scroll.set_child(Some(&editor));
     editor_area.append(&editor_scroll);
 
     let history_area = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    history_area.set_size_request(-1, 300);
+    history_area.set_size_request(-1, 200);
     let separator = gtk::Separator::new(gtk::Orientation::Horizontal);
     history_area.append(&separator);
     history_area.append(&status);
@@ -583,7 +592,7 @@ fn add_tab(
     workspace.set_shrink_end_child(false);
     workspace.set_start_child(Some(&editor_area));
     workspace.set_end_child(Some(&history_area));
-    workspace.set_position(300);
+    workspace.set_position(160);
 
     let tab = Rc::new(RefCell::new(TabState {
         session,
@@ -601,6 +610,7 @@ fn add_tab(
         output_tags: HashMap::new(),
     }));
     let history_editing = Rc::new(Cell::new(false));
+    install_editor_highlighting(&editor.buffer());
 
     {
         let tab_weak = Rc::downgrade(&tab);
@@ -613,6 +623,7 @@ fn add_tab(
         let interactive_input = interactive_input.clone();
         let send_input = send_input.clone();
         let interactive_label = interactive_label.clone();
+        let prompt = prompt.clone();
         glib::timeout_add_local(Duration::from_millis(40), move || {
             let Some(tab) = tab_weak.upgrade() else {
                 return glib::ControlFlow::Break;
@@ -653,6 +664,7 @@ fn add_tab(
                     SessionEvent::Finished { status, cwd } => {
                         state.cwd = cwd;
                         state.password_dialog_open = false;
+                        prompt.set_text(&shell_prompt(&state.cwd));
                         if active_tab
                             .borrow()
                             .as_ref()
@@ -908,6 +920,64 @@ fn add_tab(
         });
         editor.add_controller(controller);
     }
+    {
+        let tab = Rc::clone(&tab);
+        let controller = gtk::EventControllerKey::new();
+        controller.connect_key_pressed(move |_, key, _, _| {
+            if key != gdk::Key::Tab {
+                return glib::Propagation::Proceed;
+            }
+            let state = tab.borrow();
+            let buffer = state.editor.buffer();
+            let cwd = state.cwd.clone();
+            let status = state.status.clone();
+            drop(state);
+            let text = buffer
+                .text(&buffer.start_iter(), &buffer.end_iter(), false)
+                .to_string();
+            let completion = completion_at_cursor(&buffer, &text, &cwd);
+            match completion {
+                Some(completion) if completion.candidates.len() == 1 => {
+                    replace_editor_range(
+                        &buffer,
+                        completion.start,
+                        completion.end,
+                        &completion.candidates[0],
+                    );
+                    status.set_text("Suggestion complétée.");
+                }
+                Some(completion) if completion.common_prefix.len() > completion.prefix.len() => {
+                    replace_editor_range(
+                        &buffer,
+                        completion.start,
+                        completion.end,
+                        &completion.common_prefix,
+                    );
+                    status.set_text(&format!(
+                        "{} suggestions — appuyez encore sur Tab pour les afficher.",
+                        completion.candidates.len()
+                    ));
+                }
+                Some(completion) => {
+                    let suggestions = completion
+                        .candidates
+                        .iter()
+                        .take(8)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join("  ");
+                    status.set_text(&format!(
+                        "{} suggestions : {}",
+                        completion.candidates.len(),
+                        suggestions
+                    ));
+                }
+                None => status.set_text("Aucune suggestion pour cette saisie."),
+            }
+            glib::Propagation::Stop
+        });
+        editor.add_controller(controller);
+    }
 
     let page_title = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     let tab_label = gtk::Label::new(Some("Shell"));
@@ -1082,6 +1152,591 @@ fn append_terminal_output(
     insert_terminal_segment(buffer, &segment, colorize, style, tags);
 }
 
+fn shell_prompt(cwd: &Path) -> String {
+    let user = env::var("USER").unwrap_or_else(|_| "user".to_owned());
+    let host = env::var("HOSTNAME")
+        .ok()
+        .or_else(|| fs::read_to_string("/etc/hostname").ok())
+        .map(|host| host.trim().to_owned())
+        .filter(|host| !host.is_empty())
+        .unwrap_or_else(|| "localhost".to_owned());
+    format!("{user}@{host}:{} $", cwd.display())
+}
+
+fn install_editor_highlighting(buffer: &gtk::TextBuffer) {
+    let executables = installed_command_names();
+    let colors = [
+        ("shell-command", "#3fb950"),
+        ("shell-invalid-command", "#ff7b72"),
+        ("shell-keyword", "#ff7b72"),
+        ("shell-string", "#a5d6ff"),
+        ("shell-variable", "#d2a8ff"),
+        ("shell-comment", "#8b949e"),
+        ("shell-operator", "#f2cc60"),
+    ];
+    let tags: Vec<_> = colors
+        .iter()
+        .map(|(name, color)| {
+            let tag = gtk::TextTag::builder()
+                .name(*name)
+                .foreground(*color)
+                .build();
+            buffer.tag_table().add(&tag);
+            tag
+        })
+        .collect();
+    let buffer = buffer.clone();
+    buffer.connect_changed(move |buffer| {
+        let executables = &executables;
+        let start = buffer.start_iter();
+        let end = buffer.end_iter();
+        buffer.remove_all_tags(&start, &end);
+
+        let text = buffer
+            .text(&buffer.start_iter(), &buffer.end_iter(), false)
+            .to_string();
+        let chars: Vec<char> = text.chars().collect();
+        let mut ranges: Vec<(usize, usize, usize)> = Vec::new();
+        let mut index = 0;
+        let mut command_position = true;
+        while index < chars.len() {
+            let ch = chars[index];
+            if ch == '\n' {
+                command_position = true;
+                index += 1;
+            } else if ch.is_whitespace() {
+                index += 1;
+            } else if ch == '#' {
+                let start = index;
+                while index < chars.len() && chars[index] != '\n' {
+                    index += 1;
+                }
+                ranges.push((start, index, 4));
+            } else if ch == '\'' || ch == '"' {
+                let quote = ch;
+                let start = index;
+                index += 1;
+                while index < chars.len() {
+                    if chars[index] == '\\' && quote == '"' {
+                        index = (index + 2).min(chars.len());
+                    } else if chars[index] == quote {
+                        index += 1;
+                        break;
+                    } else {
+                        index += 1;
+                    }
+                }
+                ranges.push((start, index, 2));
+                command_position = false;
+            } else if ch == '$' {
+                let start = index;
+                index += 1;
+                if index < chars.len() && chars[index] == '{' {
+                    index += 1;
+                    while index < chars.len() && chars[index] != '}' {
+                        index += 1;
+                    }
+                    if index < chars.len() {
+                        index += 1;
+                    }
+                } else {
+                    while index < chars.len()
+                        && (chars[index].is_ascii_alphanumeric() || chars[index] == '_')
+                    {
+                        index += 1;
+                    }
+                }
+                ranges.push((start, index, 3));
+                command_position = false;
+            } else if "|&;><()".contains(ch) {
+                ranges.push((index, index + 1, 5));
+                command_position = matches!(ch, '|' | '&' | ';' | '(');
+                index += 1;
+            } else {
+                let start = index;
+                while index < chars.len()
+                    && !chars[index].is_whitespace()
+                    && !"|&;><()".contains(chars[index])
+                {
+                    index += 1;
+                }
+                let word: String = chars[start..index].iter().collect();
+                if command_position {
+                    let is_keyword = [
+                        "if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done",
+                        "case", "esac", "function", "in",
+                    ]
+                    .contains(&word.as_str());
+                    let tag = if is_keyword {
+                        2
+                    } else {
+                        if shell_builtin(&word) || is_executable_command(&word, executables) {
+                            0
+                        } else {
+                            1
+                        }
+                    };
+                    ranges.push((start, index, tag));
+                    command_position = matches!(
+                        word.as_str(),
+                        "sudo"
+                            | "doas"
+                            | "command"
+                            | "exec"
+                            | "env"
+                            | "time"
+                            | "nohup"
+                            | "nice"
+                            | "if"
+                            | "then"
+                            | "else"
+                            | "elif"
+                            | "while"
+                            | "until"
+                            | "!"
+                    );
+                }
+            }
+        }
+
+        for (start, end, tag_index) in ranges {
+            if start < end {
+                let start = buffer.iter_at_offset(start as i32);
+                let end = buffer.iter_at_offset(end as i32);
+                buffer.apply_tag(&tags[tag_index], &start, &end);
+            }
+        }
+    });
+}
+
+fn shell_builtin(command: &str) -> bool {
+    matches!(
+        command,
+        ":" | "."
+            | "alias"
+            | "bg"
+            | "bind"
+            | "break"
+            | "builtin"
+            | "caller"
+            | "cd"
+            | "command"
+            | "compgen"
+            | "complete"
+            | "continue"
+            | "declare"
+            | "dirs"
+            | "disown"
+            | "echo"
+            | "enable"
+            | "eval"
+            | "exec"
+            | "exit"
+            | "export"
+            | "false"
+            | "fc"
+            | "fg"
+            | "getopts"
+            | "hash"
+            | "help"
+            | "history"
+            | "jobs"
+            | "kill"
+            | "let"
+            | "local"
+            | "logout"
+            | "mapfile"
+            | "popd"
+            | "printf"
+            | "pushd"
+            | "pwd"
+            | "read"
+            | "readonly"
+            | "return"
+            | "set"
+            | "shift"
+            | "shopt"
+            | "source"
+            | "suspend"
+            | "test"
+            | "times"
+            | "trap"
+            | "true"
+            | "type"
+            | "typeset"
+            | "ulimit"
+            | "umask"
+            | "unalias"
+            | "unset"
+            | "wait"
+    )
+}
+
+fn is_executable_command(command: &str, executables: &HashSet<String>) -> bool {
+    if executables.contains(command) {
+        return true;
+    }
+    if command.contains('/') {
+        let path = Path::new(command);
+        return fs::metadata(path).is_ok_and(|metadata| {
+            metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+        });
+    }
+    false
+}
+
+fn installed_command_names() -> HashSet<String> {
+    let mut names = HashSet::new();
+    for directory in env::split_paths(&env::var_os("PATH").unwrap_or_default()) {
+        if let Ok(entries) = fs::read_dir(directory) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if fs::metadata(entry.path()).is_ok_and(|metadata| {
+                    metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+                }) {
+                    names.insert(name);
+                }
+            }
+        }
+    }
+    names
+}
+
+struct Completion {
+    start: usize,
+    end: usize,
+    prefix: String,
+    common_prefix: String,
+    candidates: Vec<String>,
+}
+
+fn completion_at_cursor(buffer: &gtk::TextBuffer, text: &str, cwd: &Path) -> Option<Completion> {
+    let chars: Vec<char> = text.chars().collect();
+    let cursor = buffer.cursor_position().max(0) as usize;
+    let cursor = cursor.min(chars.len());
+    let line_start = chars[..cursor]
+        .iter()
+        .rposition(|ch| *ch == '\n')
+        .map_or(0, |index| index + 1);
+    let token_start = shell_word_start(&chars, line_start, cursor);
+    let token_end = shell_word_end(&chars, token_start, cursor);
+    let raw_prefix: String = chars[token_start..cursor].iter().collect();
+    let prefix = unescape_shell_word(&raw_prefix);
+    let command_token = command_position(&chars[line_start..token_start]);
+    let candidates = if command_token && !prefix.contains('/') {
+        command_candidates(&prefix)
+    } else {
+        path_candidates(&prefix, cwd, quote_style(&raw_prefix))
+    };
+    if candidates.is_empty() {
+        return None;
+    }
+
+    let common_prefix = common_prefix(&candidates);
+    Some(Completion {
+        start: token_start,
+        end: token_end,
+        prefix: raw_prefix,
+        common_prefix,
+        candidates,
+    })
+}
+
+fn shell_word_start(chars: &[char], line_start: usize, cursor: usize) -> usize {
+    let mut quote = None;
+    let mut escaped = false;
+    let mut start = line_start;
+    for (offset, ch) in chars[line_start..cursor].iter().enumerate() {
+        if escaped {
+            escaped = false;
+        } else if *ch == '\\' && quote != Some('\'') {
+            escaped = true;
+        } else if matches!(*ch, '\'' | '"') {
+            if quote == Some(*ch) {
+                quote = None;
+            } else if quote.is_none() {
+                quote = Some(*ch);
+            }
+        } else if ch.is_whitespace() && quote.is_none() {
+            start = line_start + offset + 1;
+        }
+    }
+    start
+}
+
+fn shell_word_end(chars: &[char], start: usize, cursor: usize) -> usize {
+    let mut quote = None;
+    let mut escaped = false;
+    for ch in &chars[start..cursor] {
+        update_shell_quote_state(*ch, &mut quote, &mut escaped);
+    }
+    let mut index = cursor;
+    while index < chars.len() && chars[index] != '\n' {
+        let ch = chars[index];
+        let is_separator = ch.is_whitespace() && quote.is_none() && !escaped;
+        update_shell_quote_state(ch, &mut quote, &mut escaped);
+        if is_separator {
+            break;
+        }
+        index += 1;
+    }
+    index
+}
+
+fn update_shell_quote_state(ch: char, quote: &mut Option<char>, escaped: &mut bool) {
+    if *escaped {
+        *escaped = false;
+    } else if ch == '\\' && *quote != Some('\'') {
+        *escaped = true;
+    } else if matches!(ch, '\'' | '"') {
+        if *quote == Some(ch) {
+            *quote = None;
+        } else if quote.is_none() {
+            *quote = Some(ch);
+        }
+    }
+}
+
+fn quote_style(raw: &str) -> Option<char> {
+    raw.chars().find(|ch| matches!(ch, '\'' | '"'))
+}
+
+fn unescape_shell_word(raw: &str) -> String {
+    let mut result = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+    for ch in raw.chars() {
+        if escaped {
+            result.push(ch);
+            escaped = false;
+        } else if ch == '\\' && quote != Some('\'') {
+            escaped = true;
+        } else if matches!(ch, '\'' | '"') {
+            if quote == Some(ch) {
+                quote = None;
+            } else if quote.is_none() {
+                quote = Some(ch);
+            } else {
+                result.push(ch);
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+    if escaped {
+        result.push('\\');
+    }
+    result
+}
+
+fn command_position(before: &[char]) -> bool {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut command_position = true;
+    for ch in before {
+        if escaped {
+            word.push(*ch);
+            escaped = false;
+        } else if *ch == '\\' && quote != Some('\'') {
+            escaped = true;
+        } else if matches!(*ch, '\'' | '"') {
+            if quote == Some(*ch) {
+                quote = None;
+            } else if quote.is_none() {
+                quote = Some(*ch);
+            } else {
+                word.push(*ch);
+            }
+        } else if quote.is_none() && matches!(*ch, '|' | '&' | ';' | '(' | ')') {
+            word.clear();
+            words.clear();
+            command_position = true;
+        } else if ch.is_whitespace() && quote.is_none() {
+            if !word.is_empty() {
+                words.push(std::mem::take(&mut word));
+                if command_position {
+                    command_position = words
+                        .last()
+                        .is_some_and(|previous| next_word_is_command(previous));
+                }
+            }
+        } else {
+            word.push(*ch);
+        }
+    }
+    if !word.is_empty() {
+        command_position = next_word_is_command(word.as_str());
+    }
+    command_position
+}
+
+fn next_word_is_command(word: &str) -> bool {
+    matches!(
+        word,
+        "sudo"
+            | "doas"
+            | "command"
+            | "exec"
+            | "env"
+            | "time"
+            | "nohup"
+            | "nice"
+            | "if"
+            | "then"
+            | "else"
+            | "elif"
+            | "while"
+            | "until"
+            | "!"
+    )
+}
+
+fn command_candidates(prefix: &str) -> Vec<String> {
+    let mut names = std::collections::BTreeSet::new();
+    for builtin in [
+        "alias", "bg", "break", "cd", "command", "continue", "echo", "eval", "exec", "exit",
+        "export", "false", "fg", "jobs", "kill", "printf", "pwd", "read", "return", "set",
+        "source", "test", "true", "type", "ulimit", "umask", "unalias", "unset", "wait",
+    ] {
+        if builtin.starts_with(prefix) {
+            names.insert(builtin.to_owned());
+        }
+    }
+    for directory in env::split_paths(&env::var_os("PATH").unwrap_or_default()) {
+        if let Ok(entries) = fs::read_dir(directory) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if !name.starts_with(prefix) {
+                    continue;
+                }
+                if fs::metadata(entry.path()).is_ok_and(|metadata| {
+                    metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+                }) {
+                    names.insert(name);
+                }
+            }
+        }
+    }
+    names.into_iter().map(|name| format!("{name} ")).collect()
+}
+
+fn path_candidates(prefix: &str, cwd: &Path, quote: Option<char>) -> Vec<String> {
+    if prefix == "~" && env::var_os("HOME").is_some() {
+        return vec!["~/".to_owned()];
+    }
+    let ends_with_separator = prefix.ends_with('/');
+    let expanded = if prefix == "~" {
+        env::var_os("HOME").map(PathBuf::from).unwrap_or_default()
+    } else if let Some(home_path) = prefix.strip_prefix("~/") {
+        env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| cwd.to_path_buf())
+            .join(home_path)
+    } else {
+        PathBuf::from(prefix)
+    };
+    let (parent, basename) = if ends_with_separator {
+        (expanded.as_path(), String::new())
+    } else {
+        (
+            expanded.parent().unwrap_or_else(|| Path::new("")),
+            expanded
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+        )
+    };
+    let directory = if parent.as_os_str().is_empty() {
+        cwd.to_path_buf()
+    } else if parent.is_absolute() {
+        parent.to_path_buf()
+    } else {
+        cwd.join(parent)
+    };
+    let typed_parent = prefix
+        .rfind('/')
+        .map(|slash| &prefix[..=slash])
+        .unwrap_or("");
+    let mut candidates = Vec::new();
+    if let Ok(entries) = fs::read_dir(directory) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.starts_with(&basename) {
+                continue;
+            }
+            let path = format!("{typed_parent}{name}");
+            let suffix = if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                "/"
+            } else {
+                " "
+            };
+            candidates.push(format!(
+                "{}{suffix}",
+                format_shell_word(&path, quote, suffix == "/")
+            ));
+        }
+    }
+    candidates.sort();
+    candidates
+}
+
+fn format_shell_word(path: &str, quote: Option<char>, is_directory: bool) -> String {
+    match quote {
+        Some('"') => format!(
+            "\"{}\"{}",
+            path.replace('\\', "\\\\").replace('"', "\\\""),
+            if is_directory { "" } else { " " }
+        ),
+        Some('\'') => format!(
+            "'{}'{}",
+            path.replace('\'', "'\\''"),
+            if is_directory { "" } else { " " }
+        ),
+        _ => format!(
+            "{}{}",
+            path.chars()
+                .flat_map(|ch| {
+                    if ch.is_whitespace() || "|&;<>()[{}]$'\"\\!*?".contains(ch) {
+                        vec!['\\', ch]
+                    } else {
+                        vec![ch]
+                    }
+                })
+                .collect::<String>(),
+            if is_directory { "" } else { " " }
+        ),
+    }
+}
+
+fn common_prefix(candidates: &[String]) -> String {
+    let Some(first) = candidates.first() else {
+        return String::new();
+    };
+    let common_length = candidates
+        .iter()
+        .skip(1)
+        .fold(first.chars().count(), |limit, item| {
+            first
+                .chars()
+                .zip(item.chars())
+                .take(limit)
+                .take_while(|(left, right)| left == right)
+                .count()
+        });
+    first.chars().take(common_length).collect()
+}
+
+fn replace_editor_range(buffer: &gtk::TextBuffer, start: usize, end: usize, replacement: &str) {
+    let mut start_iter = buffer.iter_at_offset(start as i32);
+    let mut end_iter = buffer.iter_at_offset(end as i32);
+    buffer.delete(&mut start_iter, &mut end_iter);
+    buffer.insert(&mut start_iter, replacement);
+    buffer.place_cursor(&start_iter);
+}
+
 fn insert_terminal_segment(
     buffer: &gtk::TextBuffer,
     text: &str,
@@ -1244,11 +1899,76 @@ fn install_css(font_size: u8) {
     let provider = gtk::CssProvider::new();
     provider.load_from_data(&format!(
         ".shell-editor, .shell-output {{ font-family: monospace; font-size: {font_size}pt; }}\n\
-         .shell-output {{ background: alpha(@theme_fg_color, 0.035); }}\n"
+         .shell-output {{ background: alpha(@theme_fg_color, 0.035); }}\n\
+         .shell-prompt {{ color: @accent_color; font-family: monospace; font-weight: bold; }}\n"
     ));
     gtk::style_context_add_provider_for_display(
         &display,
         &provider,
         gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completion_uses_longest_shared_prefix() {
+        assert_eq!(
+            common_prefix(&["git ".to_owned(), "gitk ".to_owned()]),
+            "git"
+        );
+        assert_eq!(common_prefix(&[]), "");
+    }
+
+    #[test]
+    fn completed_paths_escape_spaces_for_the_shell() {
+        assert_eq!(
+            format_shell_word("My Documents/file name", None, false),
+            "My\\ Documents/file\\ name "
+        );
+    }
+
+    #[test]
+    fn token_scanner_keeps_quoted_and_escaped_spaces_together() {
+        let quoted: Vec<char> = "echo \"My files/na".chars().collect();
+        let cursor = quoted.len();
+        let start = shell_word_start(&quoted, 0, cursor);
+        assert_eq!(quoted[start..].iter().collect::<String>(), "\"My files/na");
+        assert_eq!(shell_word_end(&quoted, start, cursor), cursor);
+        assert_eq!(unescape_shell_word("\"My files/na"), "My files/na");
+
+        let escaped: Vec<char> = "cd My\\ files/na".chars().collect();
+        let cursor = escaped.len();
+        let start = shell_word_start(&escaped, 0, cursor);
+        assert_eq!(escaped[start..].iter().collect::<String>(), "My\\ files/na");
+        assert_eq!(unescape_shell_word("My\\ files/na"), "My files/na");
+    }
+
+    #[test]
+    fn completion_detects_command_positions_after_shell_operators() {
+        assert!(command_position(&[]));
+        assert!(command_position(&"sudo ".chars().collect::<Vec<_>>()));
+        assert!(command_position(
+            &"echo done && ".chars().collect::<Vec<_>>()
+        ));
+        assert!(!command_position(&"echo ".chars().collect::<Vec<_>>()));
+    }
+
+    #[test]
+    fn installed_commands_and_shell_builtins_are_recognized() {
+        let names = installed_command_names();
+        assert!(shell_builtin("cd"));
+        assert!(is_executable_command("ls", &names), "{names:?}");
+        assert!(!is_executable_command(
+            "not-a-real-editshell-command",
+            &names
+        ));
+        assert!(
+            command_candidates("ls")
+                .iter()
+                .any(|candidate| candidate == "ls ")
+        );
+    }
 }
