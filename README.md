@@ -11,12 +11,14 @@ EditShell est un prototype Linux en Rust et GTK 4 qui associe un éditeur de com
 - Exécution avec `Ctrl+Entrée` ou le bouton **Exécuter**.
 - Après l’envoi réussi, l’éditeur est vidé et la commande est ajoutée à l’historique affiché avec ses résultats.
 - Session Bash persistante par onglet, avec répertoire courant et variables exportées conservés.
+- `exit` ferme l’onglet Bash concerné ; si c’est le dernier onglet, l’application se ferme.
 - Exécution via pseudo-terminal Linux, sortie et code de retour associés à chaque exécution.
 - `clear` efface la sortie ; `Ctrl+C` ou le bouton d’arrêt interrompt la commande au premier plan sans fermer Bash.
 - Les couleurs ANSI des commandes sont rendues dans l’historique ; `ls` affiche les couleurs de fichiers et dossiers. L’activation et la palette (standard ou contraste élevé) se règlent dans **Préférences**.
 - Dialogue de saisie masquée pour les invites de mot de passe reconnues ; champ distinct pour les réponses interactives ordinaires, comme la confirmation d’une nouvelle clé hôte SSH.
 - Zone d’historique agrandie et redimensionnable avec séparateur ; le défilement suit automatiquement les nouvelles sorties.
 - Explorateur de fichiers : navigation, raccourcis vers le dossier parent et personnel, actualisation, sélection puis insertion explicite d’un chemin cité.
+- Menu contextuel au clic droit sur les fichiers et dossiers : insérer ou copier le chemin, naviguer dans un dossier depuis EditShell et ouvrir avec l’application ou l’explorateur de fichiers du système.
 - Préférences persistantes pour le thème (système, clair, sombre), la taille de police, l’affichage des couleurs ANSI et la palette de sortie.
 - Les commandes s’exécutent en arrière-plan par rapport à la boucle GTK.
 
@@ -58,7 +60,7 @@ cargo test
 6. Si une commande demande un mot de passe, un dialogue sécurisé s’ouvre ; la saisie n’est ni affichée ni ajoutée à l’historique. Pour une confirmation ordinaire (comme SSH `yes/no`), utilisez le champ **Session active** sous l’historique.
 7. Faites glisser le séparateur horizontal entre l’éditeur et l’historique pour régler leur hauteur. L’historique défile automatiquement vers la sortie la plus récente.
 8. Une commande SSH/FTP/SMB interactive reste au premier plan dans son onglet ; utilisez **Session active** pour envoyer les réponses ou commandes distantes. Pour garder un shell local disponible en parallèle, le bouton `+` ouvre un onglet Bash indépendant. `Ctrl+C` ou le bouton d’arrêt interrompt la commande au premier plan.
-9. L’explorateur latéral permet de parcourir les dossiers ; double-cliquez sur un dossier pour l’ouvrir ou sélectionnez un élément puis utilisez **Insérer le chemin**.
+9. L’explorateur latéral permet de parcourir les dossiers ; double-cliquez sur un dossier pour l’ouvrir ou sélectionnez un élément puis utilisez **Insérer le chemin**. Faites un clic droit sur un élément pour afficher les actions adaptées aux fichiers ou dossiers.
 10. Dans **Préférences**, activez ou désactivez les couleurs ANSI et choisissez la palette standard ou à contraste élevé. Les couleurs affichées sont celles émises par les commandes, par exemple `ls`.
 
 Une commande échouée ne ferme pas la session. Chaque exécution produit une nouvelle entrée dans l’historique. Pour réutiliser une commande, recopiez-la depuis l’historique vers l’éditeur.

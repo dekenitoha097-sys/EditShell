@@ -178,6 +178,13 @@ struct Explorer {
     set_root: Rc<dyn Fn(PathBuf)>,
 }
 
+struct FileMenuContext {
+    active_tab: Rc<RefCell<Option<SharedTab>>>,
+    current_path: Rc<RefCell<PathBuf>>,
+    refresh_button: gtk::Button,
+    status: gtk::Label,
+}
+
 fn build_explorer(active_tab: Rc<RefCell<Option<SharedTab>>>) -> Explorer {
     let panel = gtk::Box::new(gtk::Orientation::Vertical, 6);
     panel.set_size_request(190, -1);
@@ -208,6 +215,13 @@ fn build_explorer(active_tab: Rc<RefCell<Option<SharedTab>>>) -> Explorer {
     insert_button.set_sensitive(false);
     panel.append(&insert_button);
 
+    let explorer_status =
+        gtk::Label::new(Some("Clic droit sur un élément pour afficher les options."));
+    explorer_status.set_xalign(0.0);
+    explorer_status.set_wrap(true);
+    explorer_status.add_css_class("dim-label");
+    panel.append(&explorer_status);
+
     let list = gtk::ListBox::new();
     list.set_selection_mode(gtk::SelectionMode::Single);
     list.add_css_class("navigation-sidebar");
@@ -221,6 +235,8 @@ fn build_explorer(active_tab: Rc<RefCell<Option<SharedTab>>>) -> Explorer {
     ));
     let entries: Rc<RefCell<Vec<PathBuf>>> = Rc::new(RefCell::new(Vec::new()));
     let selected_path: Rc<RefCell<Option<PathBuf>>> = Rc::new(RefCell::new(None));
+    let active_tab_for_refresh = Rc::clone(&active_tab);
+    let refresh_button_for_rows = refresh_button.clone();
     let refresh_fn: Rc<dyn Fn()> = {
         let list = list.clone();
         let location = location.clone();
@@ -287,6 +303,29 @@ fn build_explorer(active_tab: Rc<RefCell<Option<SharedTab>>>) -> Explorer {
                 row.set_margin_end(8);
                 row_label.set_margin_top(5);
                 row_label.set_margin_bottom(5);
+
+                let context_click = gtk::GestureClick::new();
+                context_click.set_button(3);
+                let path_for_menu = child_path.clone();
+                let row_for_menu = row.clone();
+                let active_tab = Rc::clone(&active_tab_for_refresh);
+                let current_path = Rc::clone(&current_path);
+                let refresh_button = refresh_button_for_rows.clone();
+                let selected_path = Rc::clone(&selected_path);
+                let insert_button = insert_button.clone();
+                let explorer_status = explorer_status.clone();
+                let context = FileMenuContext {
+                    active_tab,
+                    current_path,
+                    refresh_button,
+                    status: explorer_status,
+                };
+                context_click.connect_pressed(move |_, _, x, y| {
+                    *selected_path.borrow_mut() = Some(path_for_menu.clone());
+                    insert_button.set_sensitive(true);
+                    show_file_context_menu(&row_for_menu, &path_for_menu, x, y, &context);
+                });
+                row.add_controller(context_click);
                 list.append(&row);
             }
         })
@@ -367,6 +406,110 @@ fn build_explorer(active_tab: Rc<RefCell<Option<SharedTab>>>) -> Explorer {
         panel: panel.upcast(),
         set_root,
     }
+}
+
+fn show_file_context_menu(
+    anchor: &impl IsA<gtk::Widget>,
+    path: &Path,
+    x: f64,
+    y: f64,
+    context: &FileMenuContext,
+) {
+    let FileMenuContext {
+        active_tab,
+        current_path,
+        refresh_button,
+        status,
+    } = context;
+    let popover = gtk::Popover::new();
+    popover.set_has_arrow(true);
+    popover.set_parent(anchor);
+    popover.connect_closed(|popover| popover.unparent());
+    popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+    let menu = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    menu.set_margin_top(6);
+    menu.set_margin_bottom(6);
+    menu.set_margin_start(6);
+    menu.set_margin_end(6);
+
+    let insert = gtk::Button::with_label("Insérer le chemin dans l’éditeur");
+    insert.set_halign(gtk::Align::Fill);
+    {
+        let path = path.to_path_buf();
+        let active_tab = Rc::clone(active_tab);
+        let status = status.clone();
+        let popover = popover.clone();
+        insert.connect_clicked(move |_| {
+            insert_path_into_editor(&active_tab, &path);
+            status.set_text(&format!("Chemin inséré : {}", path.display()));
+            popover.popdown();
+        });
+    }
+    menu.append(&insert);
+
+    let copy = gtk::Button::with_label("Copier le chemin");
+    copy.set_halign(gtk::Align::Fill);
+    {
+        let path = path.to_path_buf();
+        let anchor = anchor.clone();
+        let status = status.clone();
+        let popover = popover.clone();
+        copy.connect_clicked(move |_| {
+            anchor
+                .display()
+                .clipboard()
+                .set_text(&path.display().to_string());
+            status.set_text("Chemin copié dans le presse-papiers.");
+            popover.popdown();
+        });
+    }
+    menu.append(&copy);
+
+    if path.is_dir() {
+        let browse = gtk::Button::with_label("Ouvrir ici dans l’explorateur EditShell");
+        browse.set_halign(gtk::Align::Fill);
+        {
+            let path = path.to_path_buf();
+            let current_path = Rc::clone(current_path);
+            let refresh_button = refresh_button.clone();
+            let status = status.clone();
+            let popover = popover.clone();
+            browse.connect_clicked(move |_| {
+                *current_path.borrow_mut() = path.clone();
+                refresh_button.emit_clicked();
+                status.set_text(&format!("Dossier ouvert : {}", path.display()));
+                popover.popdown();
+            });
+        }
+        menu.append(&browse);
+    }
+
+    let open = gtk::Button::with_label(if path.is_dir() {
+        "Ouvrir dans l’explorateur de fichiers"
+    } else {
+        "Ouvrir avec l’application par défaut"
+    });
+    open.set_halign(gtk::Align::Fill);
+    {
+        let path = path.to_path_buf();
+        let status = status.clone();
+        let popover = popover.clone();
+        open.connect_clicked(move |_| {
+            let uri = gtk::gio::File::for_path(&path).uri();
+            let result = gtk::gio::AppInfo::launch_default_for_uri(
+                &uri,
+                None::<&gtk::gio::AppLaunchContext>,
+            );
+            match result {
+                Ok(()) => status.set_text(&format!("Ouverture demandée : {}", path.display())),
+                Err(error) => status.set_text(&format!("Impossible d’ouvrir l’élément : {error}")),
+            }
+            popover.popdown();
+        });
+    }
+    menu.append(&open);
+    popover.set_child(Some(&menu));
+    popover.popup();
 }
 
 fn insert_path_into_editor(active_tab: &Rc<RefCell<Option<SharedTab>>>, path: &Path) {
@@ -624,12 +767,16 @@ fn add_tab(
         let send_input = send_input.clone();
         let interactive_label = interactive_label.clone();
         let prompt = prompt.clone();
+        let notebook = notebook.clone();
+        let workspace = workspace.clone();
+        let tabs = Rc::clone(tabs);
         glib::timeout_add_local(Duration::from_millis(40), move || {
             let Some(tab) = tab_weak.upgrade() else {
                 return glib::ControlFlow::Break;
             };
             let mut state = tab.borrow_mut();
             let mut password_prompt = false;
+            let mut session_exited = false;
             while let Some(event) = state.session.try_event() {
                 match event {
                     SessionEvent::Output(text) => {
@@ -694,7 +841,34 @@ fn add_tab(
                         output.insert(&mut end, &format!("\n[erreur : {error}]\n"));
                         scroll_output_to_bottom(&output_scroll);
                     }
+                    SessionEvent::Exited => {
+                        session_exited = true;
+                        break;
+                    }
                 }
+            }
+            if session_exited {
+                drop(state);
+                let Some(page) = notebook.page_num(&workspace) else {
+                    return glib::ControlFlow::Break;
+                };
+                notebook.remove_page(Some(page));
+                let mut open_tabs = tabs.borrow_mut();
+                if (page as usize) < open_tabs.len() {
+                    open_tabs.remove(page as usize);
+                }
+                if open_tabs.is_empty() {
+                    parent_window.close();
+                    return glib::ControlFlow::Break;
+                }
+                let selected = notebook.current_page().unwrap_or(0) as usize;
+                if let Some(selected_tab) = open_tabs.get(selected).cloned() {
+                    let cwd = selected_tab.borrow().cwd.clone();
+                    cwd_label.set_text(&format!("Répertoire : {}", cwd.display()));
+                    *active_tab.borrow_mut() = Some(selected_tab);
+                    set_explorer_root(cwd);
+                }
+                return glib::ControlFlow::Break;
             }
             let running = state.session.is_running();
             interactive_input.set_sensitive(running);
