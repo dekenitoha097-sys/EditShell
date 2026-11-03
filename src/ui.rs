@@ -2,7 +2,6 @@ use editshell::config::{OutputPalette, Settings, Theme};
 use editshell::shell::{SessionEvent, ShellSession, bash_quote};
 use gtk::gdk;
 use gtk::glib;
-use gtk::prelude::*;
 use gtk4 as gtk;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -13,12 +12,14 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use vte4::prelude::*;
 
 struct TabState {
     session: ShellSession,
     cwd: PathBuf,
     editor: gtk::TextView,
     output: gtk::TextView,
+    interactive_terminal: Option<(gtk::Window, vte4::Terminal)>,
     status: gtk::Label,
     run_count: u64,
     output_tail: String,
@@ -742,6 +743,7 @@ fn add_tab(
         cwd: cwd.clone(),
         editor: editor.clone(),
         output: output.clone(),
+        interactive_terminal: None,
         status: status.clone(),
         run_count: 0,
         output_tail: String::new(),
@@ -808,9 +810,28 @@ fn add_tab(
                         state.output.buffer().set_text("");
                         state.terminal_style = AnsiStyle::default();
                     }
+                    SessionEvent::TerminalScreenStarted => {
+                        if state.interactive_terminal.is_none() {
+                            state.interactive_terminal =
+                                Some(show_interactive_terminal(&parent_window, &tab));
+                        }
+                    }
+                    SessionEvent::TerminalOutput(bytes) => {
+                        if let Some((_, terminal)) = &state.interactive_terminal {
+                            terminal.feed(&bytes);
+                        }
+                    }
+                    SessionEvent::TerminalScreenEnded => {
+                        if let Some((window, _)) = state.interactive_terminal.take() {
+                            window.set_visible(false);
+                        }
+                    }
                     SessionEvent::Finished { status, cwd } => {
                         state.cwd = cwd;
                         state.password_dialog_open = false;
+                        if let Some((window, _)) = state.interactive_terminal.take() {
+                            window.set_visible(false);
+                        }
                         prompt.set_text(&shell_prompt(&state.cwd));
                         if active_tab
                             .borrow()
@@ -835,6 +856,9 @@ fn add_tab(
                     }
                     SessionEvent::Failed(error) => {
                         state.password_dialog_open = false;
+                        if let Some((window, _)) = state.interactive_terminal.take() {
+                            window.set_visible(false);
+                        }
                         state.status.set_text(&error);
                         let output = state.output.buffer();
                         let mut end = output.end_iter();
@@ -842,6 +866,9 @@ fn add_tab(
                         scroll_output_to_bottom(&output_scroll);
                     }
                     SessionEvent::Exited => {
+                        if let Some((window, _)) = state.interactive_terminal.take() {
+                            window.set_visible(false);
+                        }
                         session_exited = true;
                         break;
                     }
@@ -1288,6 +1315,116 @@ fn show_preferences(window: &gtk::ApplicationWindow, settings: &Rc<RefCell<Setti
         dialog.close();
     });
     dialog.present();
+}
+
+fn show_interactive_terminal(
+    parent: &gtk::ApplicationWindow,
+    tab: &SharedTab,
+) -> (gtk::Window, vte4::Terminal) {
+    let terminal = vte4::Terminal::new();
+    terminal.set_hexpand(true);
+    terminal.set_vexpand(true);
+    terminal.set_scrollback_lines(10_000);
+    terminal.set_input_enabled(true);
+
+    let window = gtk::Window::builder()
+        .title("Terminal interactif")
+        .transient_for(parent)
+        .modal(true)
+        .default_width(1100)
+        .default_height(680)
+        .build();
+    let layout = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let heading = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    heading.set_margin_start(12);
+    heading.set_margin_end(12);
+    heading.set_margin_top(10);
+    heading.set_margin_bottom(8);
+    let title = gtk::Label::new(Some(
+        "Application interactive — utilisez les flèches et Entrée",
+    ));
+    title.set_xalign(0.0);
+    title.set_hexpand(true);
+    heading.append(&title);
+    let stop = gtk::Button::with_label("Interrompre");
+    heading.append(&stop);
+    layout.append(&heading);
+
+    let scroller = gtk::ScrolledWindow::new();
+    scroller.set_hexpand(true);
+    scroller.set_vexpand(true);
+    scroller.set_child(Some(&terminal));
+    layout.append(&scroller);
+    window.set_child(Some(&layout));
+
+    let weak_tab = Rc::downgrade(tab);
+    terminal.connect_commit(move |_, text, _| {
+        if let Some(tab) = weak_tab.upgrade()
+            && let Err(error) = tab.borrow().session.send_raw_input(text.as_bytes())
+        {
+            tab.borrow()
+                .status
+                .set_text(&format!("Impossible d’envoyer la touche : {error}"));
+        }
+    });
+
+    let weak_tab = Rc::downgrade(tab);
+    stop.connect_clicked(move |_| {
+        if let Some(tab) = weak_tab.upgrade()
+            && let Err(error) = tab.borrow().session.interrupt()
+        {
+            tab.borrow()
+                .status
+                .set_text(&format!("Impossible d’interrompre la commande : {error}"));
+        }
+    });
+
+    let weak_tab = Rc::downgrade(tab);
+    window.connect_close_request(move |_| {
+        if let Some(tab) = weak_tab.upgrade()
+            && let Err(error) = tab.borrow().session.send_raw_input(b"\x03")
+        {
+            tab.borrow()
+                .status
+                .set_text(&format!("Impossible d’interrompre la commande : {error}"));
+        }
+        glib::Propagation::Stop
+    });
+
+    window.present();
+    terminal.grab_focus();
+    let resize_terminal = terminal.clone();
+    let resize_window = window.clone();
+    let weak_tab = Rc::downgrade(tab);
+    let mut previous_size = (0_i32, 0_i32);
+    glib::timeout_add_local(Duration::from_millis(200), move || {
+        if !resize_window.is_visible() {
+            return glib::ControlFlow::Break;
+        }
+        let char_width = resize_terminal.char_width() as i32;
+        let char_height = resize_terminal.char_height() as i32;
+        if char_width <= 0 || char_height <= 0 {
+            return glib::ControlFlow::Continue;
+        }
+        let columns = (resize_terminal.allocated_width() / char_width).clamp(2, 500);
+        let rows = (resize_terminal.allocated_height() / char_height).clamp(2, 300);
+        if (columns, rows) != previous_size {
+            previous_size = (columns, rows);
+            resize_terminal.set_size(i64::from(columns), i64::from(rows));
+            if let Some(tab) = weak_tab.upgrade()
+                && let Err(error) = tab
+                    .borrow()
+                    .session
+                    .resize_terminal(columns as u16, rows as u16)
+            {
+                tab.borrow().status.set_text(&format!(
+                    "Impossible de redimensionner le terminal : {error}"
+                ));
+            }
+        }
+        glib::ControlFlow::Continue
+    });
+    (window, terminal)
 }
 
 fn append_terminal_output(

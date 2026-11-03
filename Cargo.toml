@@ -16,9 +16,10 @@ required-features = ["gui"]
 
 [features]
 default = []
-gui = ["dep:gtk4"]
+gui = ["dep:gtk4", "dep:vte4"]
 
 [dependencies]
 base64 = "0.22"
 libc = "0.2"
 gtk4 = { version = "0.9", optional = true }
+vte4 = { version = "0.8", optional = true }
